@@ -4,10 +4,12 @@ import { Model } from 'mongoose';
 import { Farmamedia, FarmamediaDocument } from './schemas/farmamedia.schema';
 import * as soap from 'soap';
 import * as xml2js from 'xml2js';
+import { parseStringPromise } from 'xml2js';
 import { HttpService } from '@nestjs/axios';
-import { AxiosResponse } from 'axios';
 import { lastValueFrom } from 'rxjs';
 import { CompanyInfo } from 'src/interface/company-info';
+import { AxiosResponse } from 'axios';
+import * as https from 'https';
 
 @Injectable()
 export class FarmamediaService {
@@ -18,13 +20,10 @@ export class FarmamediaService {
     private readonly httpService: HttpService
   ) {}
 
-  private wsdlUrl = 'http://webservices.farmadati.it/ws2/farmadatiitaliawebservicesm1.svc?singleWSDL';
-  private uri = 'http://webservices.farmadati.it/ws2/download.aspx';
+  private wsdlUrl = 'http://webservices-farmadati.dyndns.ws/WS2/FarmadatiItaliaWebServicesM1.svc?singleWsdl';
+  private uri = 'http://webservices-farmadati.dyndns.ws/WS_DOC/GetDoc.aspx';
   private username = 'BDF2509911';
   private password = 'qnL9xdHs';
-  private descriptionCache: Map<string, string> = new Map();
-  private productCache: Map<string, any> = new Map();
-  private companyCache = new Map<string, CompanyInfo>();
 
   async getByAIC(aic: string): Promise<any> {
     // 1️⃣ Controlla DB
@@ -43,34 +42,18 @@ export class FarmamediaService {
     let images = await this.getImages(aic);
 
     // 6️⃣ Salva in DB
-    const saved = await this.farmamediaModel.create({
-      aic: aic,
-      name,
-      shortDescription,
-      images,
-      updatedAt: new Date(),
-      data
-    });
+    //const saved = await this.farmamediaModel.create({
+      //aic: aic,
+      //name,
+      //shortDescription,
+      //images,
+      //updatedAt: new Date(),
+      //data
+   // });
 
-    return saved;
+   // return saved;
   }
 
-  async getEnabledDataSets() {
-    const client = await soap.createClientAsync(this.wsdlUrl);
-    const schema = await client.GetSchemaDataSetAsync({ Username: this.username, Password: this.password, CodiceSetDati: 'TE005' });
-    console.log(schema[0]);
-
-    return schema;
-  }
-
-  private async xmlToJson(xml: string) {
-    const parser = new xml2js.Parser({
-      explicitArray: false, // niente array inutili
-      trim: true
-    });
-
-    return await parser.parseStringPromise(xml);
-  }
 
   private async getImages(aic: string): Promise<string[]> {
     const tabelleImmagini: Record<string, { key: string; field: string }> = {
@@ -96,19 +79,22 @@ export class FarmamediaService {
         const parsed = await this.xmlToJson(response.ExecuteQueryResult.OutputValue);
         const product = parsed.TableResult?.Product;
 
-        console.log(product);
 
         if (!product) continue;
 
         const imageNames = Array.isArray(product) ? product.map(p => p[cfg.field]) : [product[cfg.field]];
-
+        const agent = new https.Agent({ rejectUnauthorized: false });
+        
         for (const name of imageNames) 
         {
-          const url = `${this.uri}?accesskey=${this.password}&tipodoc=${codiceSetDati}&nomefile=${name}`;
+          const imageUrl = `${this.uri}?accesskey=${this.password}&tipodoc=${codiceSetDati}&nomefile=${name}`;
+          console.log(imageUrl);
           try 
           {
-            const { data } = await lastValueFrom(this.httpService.get(url, { responseType: 'arraybuffer' }));
-            images.push(Buffer.from(data).toString('base64'));
+            const response: AxiosResponse<ArrayBuffer> = await lastValueFrom(
+              this.httpService.get(imageUrl, { responseType: 'arraybuffer', httpsAgent: agent })
+            );
+            images.push(Buffer.from(response.data).toString('base64'));
           } 
           catch (err) 
           {
@@ -121,42 +107,59 @@ export class FarmamediaService {
     return images;
   }
 
+
   private async getDescription(aic: string): Promise<string> {
-    if (this.descriptionCache.has(aic)) {
-      return this.descriptionCache.get(aic) ?? '';
-    }
+    const client = await soap.createClientAsync(this.wsdlUrl);
 
     let description = '';
 
-    // Mappa dataset => chiave filtro
     const datasets: Record<string, string> = {
-      TE008: 'FDI_0001', // scheda descrittiva
-      TE005: 'FDI_4887', // descrizione breve medicinali SOP-OTC
-      TE006: 'FDI_0001', // omeopatici
-      TE012: 'FDI_0001', // medicinali veterinari
-      TR039: 'FDI_0001', // descrizione estesa
-      TE018: 'FDI_0001', // sostituisce TE003
+      TE008: 'FDI_0001',
+      TE005: 'FDI_4887',
+      TE006: 'FDI_0001',
+      TE012: 'FDI_0001',
+      TR039: 'FDI_0001',
+      TE018: 'FDI_0001',
     };
 
     for (const [dataset, key] of Object.entries(datasets)) {
       try {
-        const result = await this.queryDataset(aic, dataset, key);
-        if (result) {
-          // concatena tutti i campi come paragrafi
-          for (const [field, text] of Object.entries(result)) {
-            if (text) description += `<p>${text}</p>`;
+        const params = {
+          Username: this.username,
+          Password: this.password,
+          CodiceSetDati: dataset,
+          CampiDaEstrarre: { string: [key] },
+          Filtri: { Filter: [{ Key: key, Operator: '=', Value: aic, OrGroup: 0 }] },
+          Ordinamento: null,
+          Distinct: false,
+          Count: false,
+          PageN: 1,
+          PagingN: 1,
+        };
+
+        const [response] = await client.ExecuteQueryAsync(params);
+
+       //console.log(response);
+
+        if (response?.ExecuteQueryResult?.DescEsito === 'OK') {
+          const xml = response.ExecuteQueryResult.OutputValue;
+          if (!xml) continue;
+
+          const parsed = await parseStringPromise(xml, { explicitArray: false });
+
+          const product = parsed?.TableResult?.Product;
+          if (!product) continue;
+
+          // equivalente di: (array)$xml->Product->children()
+          for (const value of Object.values(product)) {
+            if (typeof value === 'string' && value.trim()) {
+              description += `<p>${value}</p>`;
+            }
           }
         }
       } catch (err) {
         this.logger.warn(`Errore dataset ${dataset} per AIC ${aic}: ${err.message}`);
       }
-    }
-
-    const product = await this.getProductData(aic);
-    //const company = await this.getCompanyDetails(product.FDI_0040);
-
-    if (description) {
-      this.descriptionCache.set(aic, description);
     }
 
     return description;
@@ -207,10 +210,6 @@ export class FarmamediaService {
   }
 
   private async getProductData(aic: string): Promise<any> {
-    if (this.productCache.has(aic)) {
-      return this.productCache.get(aic);
-    }
-
     const tabelleDescrittive: Record<string, string> = {
       TE001: 'FDI_0001', // parafarmaci, dispositivi medici
       TE002: 'FDI_0001', // omeopatici
@@ -234,16 +233,16 @@ export class FarmamediaService {
         };
 
         const [response] = await client.ExecuteQueryAsync(params);
+
+        console.log(response);
+
         const result = response?.ExecuteQueryResult;
 
         if (result?.DescEsito === 'OK' && result.OutputValue) {
           const parsed = await xml2js.parseStringPromise(result.OutputValue, { explicitArray: false });
           const product = parsed?.TableResult?.Product;
 
-          if (product) {
-            this.productCache.set(aic, product);
-            return product;
-          }
+          return product;
         }
       } catch (err) {
         this.logger.warn(`Errore recupero dati prodotto da dataset ${dataset} per AIC ${aic}: ${err.message}`);
@@ -254,41 +253,8 @@ export class FarmamediaService {
     return {};
   }
 
-  private async queryDataset(aic: string, dataset: string, key: string): Promise<Record<string, string> | null> {
-    const client = await soap.createClientAsync(this.wsdlUrl);
-
-    const params = {
-      Username: this.username,
-      Password: this.password,
-      CodiceSetDati: dataset,
-      CampiDaEstrarre: { string: ['*'] }, // oppure specifici campi se li conosci
-      Filtri: { Filter: [{ Key: key, Operator: '=', Value: aic, OrGroup: 0 }] },
-      Ordinamento: null,
-      Distinct: false,
-      Count: false,
-      PageN: 1,
-      PagingN: 1,
-    };
-
-    const [response] = await client.ExecuteQueryAsync(params);
-    const result = response?.ExecuteQueryResult;
-
-    if (!result || result.CodEsito !== 'OK' || !result.OutputValue) return null;
-
-    const parsed = await xml2js.parseStringPromise(result.OutputValue, { explicitArray: false, mergeAttrs: true });
-    const product = parsed?.TableResult?.Product;
-    if (!product) return null;
-
-    return Array.isArray(product) ? product[0] : product;
-  }
-
   private async getCompanyDetails(companyNumber: string): Promise<CompanyInfo | null> {
     try {
-      // ✅ Controlla cache
-      if (this.companyCache.has(companyNumber)) {
-        return this.companyCache.get(companyNumber) ?? null;
-      }
-
       // ⚡ Costruzione chiamata SOAP
       const soapBody = {
         Username: this.username,
@@ -333,13 +299,28 @@ export class FarmamediaService {
         website: product.FDI_T012 || '',
       };
 
-      // ✅ Salva in cache
-      this.companyCache.set(companyNumber, companyInfo);
-
       return companyInfo;
     } catch (err) {
       this.logger.error(`Errore recupero informazioni ditta '${companyNumber}': ${err.message}`);
       return null;
     }
+  }
+
+  
+  async getEnabledDataSets() {
+    const client = await soap.createClientAsync(this.wsdlUrl);
+    const schema = await client.GetSchemaDataSetAsync({ Username: this.username, Password: this.password, CodiceSetDati: 'TE005' });
+    console.log(schema[0]);
+
+    return schema;
+  }
+
+  private async xmlToJson(xml: string) {
+    const parser = new xml2js.Parser({
+      explicitArray: false, // niente array inutili
+      trim: true
+    });
+
+    return await parser.parseStringPromise(xml);
   }
 }
